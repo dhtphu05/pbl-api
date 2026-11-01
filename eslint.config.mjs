@@ -81,6 +81,7 @@ export default tsEslint.config(
   ...serviceIsolationConfigs,
   {
     files: ['libs/*/src/**/*.ts', 'libs/*/test/**/*.ts'],
+    ignores: ['libs/events/test/m8-*.int-spec.ts'],
     rules: {
       'no-restricted-imports': [
         'error',

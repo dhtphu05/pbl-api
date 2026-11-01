@@ -268,10 +268,15 @@ export class WebhooksService {
         envelope.eventType === 'ORDER_CANCELLED') &&
       envelope.externalOrderId
     ) {
+      const dataObj = envelope.parsedPayload.data as any;
       const inlineOrder =
-        (envelope.parsedPayload.data as any)?.order_detail ??
+        dataObj?.order_detail ??
         (envelope.parsedPayload as any).order_detail ??
-        undefined;
+        (Array.isArray(dataObj?.item_list) ||
+        Array.isArray(dataObj?.order_items) ||
+        Array.isArray(dataObj?.lines)
+          ? dataObj
+          : undefined);
 
       const enqueued = await this.syncJobsService.enqueueSyncJob({
         tenantId,

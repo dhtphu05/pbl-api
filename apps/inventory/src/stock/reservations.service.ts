@@ -594,7 +594,12 @@ export class ReservationsService {
 
       const shortages: WarehouseStockShortage[] = [];
       for (const line of normalizedLines) {
-        await assertCatalogSkuEligible(em, prefix, tenantId, line.skuId);
+        line.skuId = await assertCatalogSkuEligible(
+          em,
+          prefix,
+          tenantId,
+          line.skuId,
+        );
 
         const balanceRows = await em.query(
           `

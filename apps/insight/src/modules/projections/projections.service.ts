@@ -1478,9 +1478,16 @@ export class ProjectionsService {
   ): Promise<{ applied: boolean }> {
     const tenantId = event.tenantId || TenantContext.require();
     const p = event.payload;
-    const warehouseId = p.warehouseId;
-    const skuCode = String(p.skuCode ?? p.skuId ?? 'UNKNOWN-SKU');
     const movementType = String(p.movementType ?? 'STOCK_CHANGE').toUpperCase();
+    const warehouseId =
+      p.warehouseId ??
+      (movementType === 'TRANSFER_RECEIPT'
+        ? ((p as any).toWarehouseId ?? (p as any).fromWarehouseId)
+        : ((p as any).fromWarehouseId ?? (p as any).toWarehouseId));
+    if (!warehouseId || (!p.skuCode && !p.skuId)) {
+      return { applied: false };
+    }
+    const skuCode = String(p.skuCode ?? p.skuId ?? 'UNKNOWN-SKU');
     const occurredAt =
       p.occurredAt ?? event.occurredAt ?? new Date().toISOString();
     const dateBucket = toReportingDateBucket(occurredAt);

@@ -70,11 +70,26 @@ export class SalesOrderClient {
     CanonicalSalesOrderResult & { key: string }
   >();
   private crashAfterSalesSuccessKeys = new Set<string>();
+  private canonicalSalesDelegate:
+    | ((
+        cmd: CreateCanonicalSalesOrderCommand,
+      ) => Promise<CanonicalSalesOrderResult>)
+    | null = null;
 
   constructor(
     private readonly dataSource: DataSource,
     @Optional() private readonly http?: InternalHttpClient,
   ) {}
+
+  setCanonicalSalesDelegate(
+    delegate:
+      | ((
+          cmd: CreateCanonicalSalesOrderCommand,
+        ) => Promise<CanonicalSalesOrderResult>)
+      | null,
+  ): void {
+    this.canonicalSalesDelegate = delegate;
+  }
 
   simulateCrashAfterSalesCreate(
     tenantId: string,
@@ -112,6 +127,24 @@ export class SalesOrderClient {
         ...existing,
         replayed: true,
       };
+    }
+
+    if (this.canonicalSalesDelegate) {
+      const delegated = await this.canonicalSalesDelegate(cmd);
+      this.canonicalOrdersByKey.set(key, delegated);
+      this.canonicalOrdersById.set(delegated.internalOrderId, {
+        ...delegated,
+        key,
+      });
+      if (this.crashAfterSalesSuccessKeys.has(key)) {
+        this.crashAfterSalesSuccessKeys.delete(key);
+        throw new IntegrationDomainError(
+          IntegrationDomainErrorCode.PROVIDER_TIMEOUT_UNKNOWN_OUTCOME,
+          `Simulated network/worker crash after Sales created canonical order ${delegated.internalOrderId} for ${cmd.externalOrderId}`,
+          504,
+        );
+      }
+      return delegated;
     }
 
     if (process.env.SALES_SERVICE_URL && this.http) {

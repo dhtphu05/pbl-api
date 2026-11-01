@@ -102,21 +102,30 @@ export class CatalogClient {
       manager.connection,
       'catalog_variant_projection',
     );
+    const incomingVersion = Number(event.payload.aggregateVersion ?? 1);
+    const incomingUpdatedAt =
+      event.payload.updatedAt ?? event.occurredAt ?? new Date().toISOString();
     await manager.query(
       `
       UPDATE ${table}
       SET
         unit_price = $3::numeric(18,2),
+        aggregate_version = GREATEST(aggregate_version, $5::int),
         source_updated_at = $4::timestamptz,
         synced_at = now()
       WHERE tenant_id = $1
         AND variant_id = $2
+        AND (
+          aggregate_version < $5::int
+          OR (aggregate_version = $5::int AND source_updated_at <= $4::timestamptz)
+        )
       `,
       [
         event.tenantId,
         event.payload.variantId,
         event.payload.price,
-        event.payload.updatedAt,
+        incomingUpdatedAt,
+        incomingVersion,
       ],
     );
   }

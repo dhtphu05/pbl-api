@@ -36,9 +36,24 @@ services:
       AUTH_JWKS_URL: http://platform:3000/.well-known/jwks.json
       REDIS_HOST: redis
       REDIS_PORT: "6379"
+      DATABASE_HOST: postgres
+      DATABASE_PORT: "5432"
+      DATABASE_USERNAME: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_NAME: pbl
+      DATABASE_SCHEMA: catalog
+      EVENTS_TRANSPORT: sqs-direct
+      AWS_REGION: ap-southeast-1
+      AWS_ENDPOINT_URL_SQS: http://elasticmq:9324
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      elasticmq:
+        condition: service_started
     networks:
       - pbl-network
-
 
   finance:
     build:
@@ -51,6 +66,22 @@ services:
       AUTH_JWKS_URL: http://platform:3000/.well-known/jwks.json
       REDIS_HOST: redis
       REDIS_PORT: "6379"
+      DATABASE_HOST: postgres
+      DATABASE_PORT: "5432"
+      DATABASE_USERNAME: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_NAME: pbl
+      DATABASE_SCHEMA: finance
+      EVENTS_TRANSPORT: sqs-direct
+      AWS_REGION: ap-southeast-1
+      AWS_ENDPOINT_URL_SQS: http://elasticmq:9324
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      elasticmq:
+        condition: service_started
     networks:
       - pbl-network
 
@@ -65,6 +96,25 @@ services:
       AUTH_JWKS_URL: http://platform:3000/.well-known/jwks.json
       REDIS_HOST: redis
       REDIS_PORT: "6379"
+      SALES_SERVICE_URL: http://sales:3000
+      INVENTORY_SERVICE_URL: http://inventory:3000
+      INTEGRATION_ENCRYPTION_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      DATABASE_HOST: postgres
+      DATABASE_PORT: "5432"
+      DATABASE_USERNAME: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_NAME: pbl
+      DATABASE_SCHEMA: integration
+      EVENTS_TRANSPORT: sqs-direct
+      AWS_REGION: ap-southeast-1
+      AWS_ENDPOINT_URL_SQS: http://elasticmq:9324
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      elasticmq:
+        condition: service_started
     networks:
       - pbl-network
 
@@ -143,8 +193,11 @@ services:
       AUTH_JWKS_URL: http://platform:3000/.well-known/jwks.json
       REDIS_HOST: redis
       REDIS_PORT: "6379"
-      # the one synchronous call: sales holds stock here before it sells (ADR-0010)
+      # synchronous cross-service dependencies (ADR-0010 & M8 Saga Coordination)
       INVENTORY_URL: http://inventory:3000
+      CATALOG_URL: http://catalog:3000
+      CUSTOMER_URL: http://customer:3000
+      FINANCE_URL: http://finance:3000
       DATABASE_HOST: postgres
       DATABASE_PORT: "5432"
       DATABASE_USERNAME: postgres
@@ -176,6 +229,22 @@ services:
       AUTH_JWKS_URL: http://platform:3000/.well-known/jwks.json
       REDIS_HOST: redis
       REDIS_PORT: "6379"
+      DATABASE_HOST: postgres
+      DATABASE_PORT: "5432"
+      DATABASE_USERNAME: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_NAME: pbl
+      DATABASE_SCHEMA: customer
+      EVENTS_TRANSPORT: sqs-direct
+      AWS_REGION: ap-southeast-1
+      AWS_ENDPOINT_URL_SQS: http://elasticmq:9324
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      elasticmq:
+        condition: service_started
     networks:
       - pbl-network
 

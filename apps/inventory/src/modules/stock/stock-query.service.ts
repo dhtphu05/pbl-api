@@ -154,7 +154,16 @@ export class StockQueryService {
           ON t.tenant_id = b.tenant_id
           AND t.warehouse_id = b.warehouse_id
           AND t.sku_id = b.sku_id
-        WHERE b.tenant_id = $1 AND b.sku_id = $2
+        WHERE b.tenant_id = $1
+          AND (
+            b.sku_id::text = $2
+            OR EXISTS (
+              SELECT 1 FROM ${prefix}"catalog_sku_projection" csp
+              WHERE csp.tenant_id = b.tenant_id
+                AND csp.sku_id = b.sku_id
+                AND csp.sku_code = $2
+            )
+          )
         ORDER BY w.code ASC
         `,
         [tenantId, skuId],

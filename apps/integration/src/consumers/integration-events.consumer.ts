@@ -76,20 +76,30 @@ export class IntegrationEventsConsumer {
     await em.query(`SELECT set_config('app.tenant_id', $1, true)`, [
       event.tenantId,
     ]);
+    const catalogVariant = await em
+      .getRepository(IntegrationCatalogVariantEntity)
+      .findOne({
+        where: [
+          { tenantId: event.tenantId, variantId: event.payload.skuId },
+          { tenantId: event.tenantId, skuCode: event.payload.skuId },
+        ],
+      });
+    const resolvedVariantId = catalogVariant?.variantId ?? event.payload.skuId;
+
     const existing = await em
       .getRepository(IntegrationStockProjectionEntity)
       .findOne({
         where: {
           tenantId: event.tenantId,
           warehouseId: event.payload.warehouseId,
-          skuId: event.payload.skuId,
+          skuId: resolvedVariantId,
         },
       });
     const nextVersion = existing ? Number(existing.stockVersion) + 1 : 1;
 
     await this.inventorySyncService.recordStockChangeAndPublish({
       tenantId: event.tenantId,
-      internalVariantId: event.payload.skuId,
+      internalVariantId: resolvedVariantId,
       warehouseId: event.payload.warehouseId,
       onHandQty: Number(event.payload.onHandAfter),
       reservedQty: Number(event.payload.reservedAfter),

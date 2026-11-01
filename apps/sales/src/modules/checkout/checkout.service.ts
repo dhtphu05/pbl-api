@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { TenantContext } from '@pbl/common';
 import {
   OrderCompletedPayload,
@@ -25,6 +25,8 @@ import {
   parseVndAmount,
   validateOrderTenders,
 } from '../../domain/sales-domain';
+import { CustomerLoyaltyClient } from '../../infrastructure/customer-client/customer-loyalty.client';
+import { FinanceCreditClient } from '../../infrastructure/finance-client/finance-credit.client';
 import {
   getSchemaPrefix,
   nextTenantDocumentCode,
@@ -44,6 +46,20 @@ import { PosService } from '../pos/pos.service';
 import { PromotionsService } from '../promotions/promotions.service';
 import { ConfirmCheckoutPaymentDto, PosCheckoutDto } from './checkout.dto';
 
+export interface SagaQuoteMetadata {
+  couponCode: string | null;
+  redeemLoyaltyPoints?: number;
+  loyaltyHoldKey?: string | null;
+  loyaltyHoldId?: string | null;
+  loyaltyCommitted?: boolean;
+  creditAuthKey?: string | null;
+  creditAuthId?: string | null;
+  creditAmount?: string | null;
+  creditCommitted?: boolean;
+}
+
+export type PersistedQuoteJson = CalculatedOrderQuote & SagaQuoteMetadata;
+
 export interface PosCheckoutResult {
   checkoutId: string;
   tenantId: string;
@@ -53,11 +69,13 @@ export interface PosCheckoutResult {
   state: CheckoutWorkflowState;
   reservationIdempotencyKey: string;
   reservationId: string | null;
+  loyaltyHoldId?: string | null;
+  creditAuthorizationId?: string | null;
   orderId: string | null;
   orderCode?: string;
   paymentStatus?: string;
   fulfillmentStatus?: string;
-  quote: CalculatedOrderQuote & { couponCode: string | null };
+  quote: PersistedQuoteJson;
   tenders: ValidatedTenderSummary;
   replayed: boolean;
 }
@@ -78,6 +96,7 @@ export function hashPosCheckoutPayload(dto: PosCheckoutDto): string {
         orderDiscountType: dto.orderDiscountType ?? 'NONE',
         orderDiscountValue: Number(dto.orderDiscountValue ?? 0),
         couponCode: dto.couponCode?.trim().toUpperCase() ?? null,
+        redeemLoyaltyPoints: Number(dto.redeemLoyaltyPoints ?? 0),
         shippingFee: Number(dto.shippingFee ?? 0),
         paymentMethod: dto.paymentMethod ?? null,
         tenderedCash:
@@ -117,6 +136,10 @@ export class CheckoutService {
     private readonly promotionsService: PromotionsService,
     private readonly inventoryClient: InventoryClient,
     private readonly outbox: EventOutbox,
+    @Optional()
+    private readonly customerLoyaltyClient?: CustomerLoyaltyClient,
+    @Optional()
+    private readonly financeCreditClient?: FinanceCreditClient,
   ) {}
 
   async checkout(
@@ -155,8 +178,17 @@ export class CheckoutService {
     // Step 1: Pre-flight validation (branch active, shift open, Catalog price waterfall, discount authority, tenders)
     await this.validateBranchAndShift(tenantId, dto.branchId, dto.shiftId);
 
+    const redeemPoints = Math.trunc(Number(dto.redeemLoyaltyPoints ?? 0));
+    if (redeemPoints > 0 && !dto.customerId) {
+      throw new SalesDomainError(
+        SalesDomainErrorCode.VALIDATION_ERROR,
+        'customerId is required when redeeming loyalty points',
+        422,
+      );
+    }
+
     const primaryRole = roles[0] ?? 'cashier';
-    const quote = await this.posService.resolveAndQuoteLines({
+    const rawQuote = await this.posService.resolveAndQuoteLines({
       branchId: dto.branchId,
       customerId: dto.customerId,
       lines: dto.lines,
@@ -169,12 +201,27 @@ export class CheckoutService {
       discountApprovedBy: dto.discountApprovedBy,
     });
 
-    const tenderInputs = this.normalizeTenderInputs(dto, quote.grandTotal);
-    const tenderSummary = validateOrderTenders(quote.grandTotal, tenderInputs);
+    const tenderInputs = this.normalizeTenderInputs(dto, rawQuote.grandTotal);
+    const tenderSummary = validateOrderTenders(
+      rawQuote.grandTotal,
+      tenderInputs,
+    );
     const primaryPaymentMethod = this.resolvePrimaryPaymentMethod(
       tenderSummary,
       dto.paymentMethod,
     );
+
+    const onAccountAmountVnd = tenderSummary.tenders
+      .filter((t) => t.method === 'ON_ACCOUNT')
+      .reduce((acc, t) => acc + parseVndAmount(t.amount, true), 0n);
+
+    if (onAccountAmountVnd > 0n && !dto.customerId) {
+      throw new SalesDomainError(
+        SalesDomainErrorCode.VALIDATION_ERROR,
+        'customerId is required for ON_ACCOUNT credit sale',
+        422,
+      );
+    }
 
     const checkoutId = deterministicUuid(
       `pos-chk:${tenantId}:${idempotencyKey}`,
@@ -183,6 +230,27 @@ export class CheckoutService {
     const reservationIdempotencyKey = deterministicUuid(
       `pos-rsv:${tenantId}:${idempotencyKey}`,
     );
+    const loyaltyHoldKey =
+      redeemPoints > 0
+        ? deterministicUuid(`pos-loy:${tenantId}:${idempotencyKey}`)
+        : null;
+    const creditAuthKey =
+      onAccountAmountVnd > 0n
+        ? deterministicUuid(`pos-crd:${tenantId}:${idempotencyKey}`)
+        : null;
+
+    const quote: PersistedQuoteJson = {
+      ...rawQuote,
+      redeemLoyaltyPoints: redeemPoints > 0 ? redeemPoints : 0,
+      loyaltyHoldKey,
+      loyaltyHoldId: null,
+      loyaltyCommitted: false,
+      creditAuthKey,
+      creditAuthId: null,
+      creditAmount:
+        onAccountAmountVnd > 0n ? formatVnd(onAccountAmountVnd) : null,
+      creditCommitted: false,
+    };
 
     // Step 2: Persist checkout_workflow in RESERVING_STOCK (and atomically claim coupon if present)
     let workflow: CheckoutWorkflowEntity;
@@ -282,18 +350,86 @@ export class CheckoutService {
       throw error;
     }
 
+    // Step 2b: Reserve Loyalty Points in Customer Service if redeemLoyaltyPoints > 0 (Workflow C)
+    if (redeemPoints > 0 && dto.customerId && loyaltyHoldKey) {
+      const loyaltyHoldId = await this.executeLoyaltyHoldStep(
+        tenantId,
+        workflow,
+        quote,
+        dto.customerId,
+        orderId,
+        redeemPoints,
+        loyaltyHoldKey,
+        staffId,
+      );
+      quote.loyaltyHoldId = loyaltyHoldId;
+
+      if (dto.simulateFailureAfterLoyaltyHold) {
+        await this.updateWorkflowState(tenantId, workflow.id, {
+          state: 'RECOVERY_PENDING',
+          quoteJson: quote,
+          lastError: 'SIMULATED_FAILURE_AFTER_LOYALTY_HOLD',
+        });
+        throw new SalesDomainError(
+          SalesDomainErrorCode.STOCK_RESERVATION_UNKNOWN,
+          'Simulated failure after loyalty point hold; checkout placed in RECOVERY_PENDING',
+          503,
+          {
+            checkoutId: workflow.id,
+            state: 'RECOVERY_PENDING',
+            loyaltyHoldId,
+          },
+        );
+      }
+    }
+
+    // Step 2c: Authorize Credit in Finance Service if ON_ACCOUNT (Workflow D)
+    if (onAccountAmountVnd > 0n && dto.customerId && creditAuthKey) {
+      const creditAuthId = await this.executeCreditAuthStep(
+        tenantId,
+        workflow,
+        quote,
+        dto.customerId,
+        orderId,
+        formatVnd(onAccountAmountVnd),
+        creditAuthKey,
+        staffId,
+      );
+      quote.creditAuthId = creditAuthId;
+
+      if (dto.simulateFailureAfterCreditAuth) {
+        await this.updateWorkflowState(tenantId, workflow.id, {
+          state: 'RECOVERY_PENDING',
+          quoteJson: quote,
+          lastError: 'SIMULATED_FAILURE_AFTER_CREDIT_AUTH',
+        });
+        throw new SalesDomainError(
+          SalesDomainErrorCode.STOCK_RESERVATION_UNKNOWN,
+          'Simulated failure after credit authorization; checkout placed in RECOVERY_PENDING',
+          503,
+          {
+            checkoutId: workflow.id,
+            state: 'RECOVERY_PENDING',
+            creditAuthorizationId: creditAuthId,
+          },
+        );
+      }
+    }
+
     // Step 3: Reserve Stock in Inventory via S2S HTTP (Zero DB transaction held open!)
     const reservationId = await this.executeReserveStep(
       tenantId,
       workflow,
       quote,
       orderId,
+      staffId,
     );
 
     if (dto.simulateFailureAfterReserve) {
       await this.updateWorkflowState(tenantId, workflow.id, {
         state: 'RECOVERY_PENDING',
         reservationId,
+        quoteJson: quote,
         lastError: 'SIMULATED_FAILURE_AFTER_RESERVE',
       });
       throw new SalesDomainError(
@@ -304,6 +440,8 @@ export class CheckoutService {
           checkoutId: workflow.id,
           state: 'RECOVERY_PENDING',
           reservationId,
+          loyaltyHoldId: quote.loyaltyHoldId,
+          creditAuthorizationId: quote.creditAuthId,
         },
       );
     }
@@ -313,6 +451,7 @@ export class CheckoutService {
       await this.updateWorkflowState(tenantId, workflow.id, {
         state: 'AWAITING_PAYMENT',
         reservationId,
+        quoteJson: quote,
       });
       return {
         checkoutId: workflow.id,
@@ -323,6 +462,8 @@ export class CheckoutService {
         state: 'AWAITING_PAYMENT',
         reservationIdempotencyKey: workflow.reservationIdempotencyKey,
         reservationId,
+        loyaltyHoldId: quote.loyaltyHoldId ?? null,
+        creditAuthorizationId: quote.creditAuthId ?? null,
         orderId: null,
         paymentStatus: tenderSummary.paymentStatus,
         fulfillmentStatus: 'RESERVED',
@@ -332,7 +473,7 @@ export class CheckoutService {
       };
     }
 
-    // Step 5 & 6: Commit Stock Reservation & Finalize Local Order + Tenders + Shift Cash + Outbox
+    // Step 5 & 6: Commit Stock Reservation, Loyalty Hold, Credit Auth & Finalize Local Order + Outbox
     return this.commitAndFinalizeCheckout(
       tenantId,
       workflow.id,
@@ -343,6 +484,8 @@ export class CheckoutService {
       staffId,
       false,
       Boolean(dto.simulateFailureAfterCommit),
+      false,
+      Boolean(dto.simulateFailureAfterStockCommitBeforeLoyaltyCommit),
     );
   }
 
@@ -402,9 +545,7 @@ export class CheckoutService {
       );
     }
 
-    const quote = wf.quoteJson as CalculatedOrderQuote & {
-      couponCode: string | null;
-    };
+    const quote = wf.quoteJson as PersistedQuoteJson;
     const prevTenders = wf.tendersJson as ValidatedTenderSummary;
     const confirmedTenders: ValidatedTenderSummary = {
       ...prevTenders,
@@ -432,6 +573,7 @@ export class CheckoutService {
         wf,
         quote,
         orderId,
+        actorId,
       );
     }
 
@@ -473,11 +615,27 @@ export class CheckoutService {
       return this.buildCheckoutResultFromWorkflow(tenantId, wf, true);
     }
 
+    const quote = (wf.quoteJson ?? {}) as PersistedQuoteJson;
     if (wf.reservationId) {
       await this.inventoryClient.releaseWarehouseReservation(
         wf.reservationId,
         reason ?? 'POS_CHECKOUT_CANCELLED',
       );
+    }
+    if (quote.loyaltyHoldId && !quote.loyaltyCommitted) {
+      await this.customerLoyaltyClient?.releaseHold({
+        actorId,
+        holdId: quote.loyaltyHoldId,
+        reason: reason ?? 'POS_CHECKOUT_CANCELLED',
+        idempotencyKey: `${quote.loyaltyHoldKey ?? wf.id}:release`,
+      });
+    }
+    if (quote.creditAuthId && !quote.creditCommitted) {
+      await this.financeCreditClient?.releaseAuthorization({
+        actorId,
+        authorizationId: quote.creditAuthId,
+        reason: reason ?? 'POS_CHECKOUT_CANCELLED',
+      });
     }
 
     const orderId = deterministicUuid(
@@ -631,15 +789,51 @@ export class CheckoutService {
       );
     }
 
-    const quote = wf.quoteJson as CalculatedOrderQuote & {
-      couponCode: string | null;
-    };
+    const quote = wf.quoteJson as PersistedQuoteJson;
     const tenderSummary = wf.tendersJson as ValidatedTenderSummary;
     const orderId =
       wf.orderId ??
       deterministicUuid(`pos-ord:${tenantId}:${wf.idempotencyKey}`);
 
-    // Recover or execute reservation
+    // Recover or execute loyalty hold if needed
+    if (
+      (quote.redeemLoyaltyPoints ?? 0) > 0 &&
+      wf.customerId &&
+      quote.loyaltyHoldKey &&
+      !quote.loyaltyHoldId
+    ) {
+      quote.loyaltyHoldId = await this.executeLoyaltyHoldStep(
+        tenantId,
+        wf,
+        quote,
+        wf.customerId,
+        orderId,
+        quote.redeemLoyaltyPoints!,
+        quote.loyaltyHoldKey,
+        actorId,
+      );
+    }
+
+    // Recover or execute credit authorization if needed
+    if (
+      quote.creditAmount &&
+      wf.customerId &&
+      quote.creditAuthKey &&
+      !quote.creditAuthId
+    ) {
+      quote.creditAuthId = await this.executeCreditAuthStep(
+        tenantId,
+        wf,
+        quote,
+        wf.customerId,
+        orderId,
+        quote.creditAmount,
+        quote.creditAuthKey,
+        actorId,
+      );
+    }
+
+    // Recover or execute stock reservation
     let reservationId = wf.reservationId;
     let reservationAlreadyCommitted = Boolean(wf.commitConfirmed);
 
@@ -659,6 +853,8 @@ export class CheckoutService {
             wf.id,
             orderId,
             existingRsv.state,
+            quote,
+            actorId,
           );
         }
         reservationId = existingRsv.reservationId;
@@ -676,6 +872,7 @@ export class CheckoutService {
           wf,
           quote,
           orderId,
+          actorId,
         );
       }
     } else if (!reservationAlreadyCommitted) {
@@ -688,6 +885,8 @@ export class CheckoutService {
             wf.id,
             orderId,
             rsvStatus.state,
+            quote,
+            actorId,
           );
         }
         if (rsvStatus.state === 'COMMITTED') {
@@ -700,6 +899,7 @@ export class CheckoutService {
       await this.updateWorkflowState(tenantId, wf.id, {
         state: 'AWAITING_PAYMENT',
         reservationId,
+        quoteJson: quote,
       });
       const updated = await this.findWorkflowById(tenantId, wf.id);
       return this.buildCheckoutResultFromWorkflow(tenantId, updated!, replayed);
@@ -716,6 +916,7 @@ export class CheckoutService {
       replayed,
       false,
       reservationAlreadyCommitted,
+      false,
     );
   }
 
@@ -724,7 +925,24 @@ export class CheckoutService {
     checkoutId: string,
     orderId: string,
     rsvState: string,
+    quote?: PersistedQuoteJson,
+    actorId?: string,
   ): Promise<never> {
+    if (quote?.loyaltyHoldId && !quote.loyaltyCommitted) {
+      await this.customerLoyaltyClient?.releaseHold({
+        actorId: actorId ?? 'system',
+        holdId: quote.loyaltyHoldId,
+        reason: `RESERVATION_${rsvState}`,
+        idempotencyKey: `${quote.loyaltyHoldKey ?? checkoutId}:release`,
+      });
+    }
+    if (quote?.creditAuthId && !quote.creditCommitted) {
+      await this.financeCreditClient?.releaseAuthorization({
+        actorId: actorId ?? 'system',
+        authorizationId: quote.creditAuthId,
+        reason: `RESERVATION_${rsvState}`,
+      });
+    }
     const prefix = getSchemaPrefix(this.dataSource);
     await this.dataSource.transaction(async (em) => {
       await em.query(`SELECT set_config('app.tenant_id', $1, true)`, [
@@ -749,11 +967,190 @@ export class CheckoutService {
     );
   }
 
+  private async executeLoyaltyHoldStep(
+    tenantId: string,
+    workflow: CheckoutWorkflowEntity,
+    quote: PersistedQuoteJson,
+    customerId: string,
+    orderId: string,
+    points: number,
+    loyaltyHoldKey: string,
+    actorId: string,
+  ): Promise<string> {
+    if (!this.customerLoyaltyClient) {
+      throw new SalesDomainError(
+        SalesDomainErrorCode.LOYALTY_HOLD_FAILED,
+        'CustomerLoyaltyClient is not available',
+        503,
+      );
+    }
+    try {
+      const res = await this.customerLoyaltyClient.createHold({
+        actorId,
+        customerId,
+        orderId,
+        checkoutId: workflow.id,
+        points,
+        idempotencyKey: loyaltyHoldKey,
+      });
+      quote.loyaltyHoldId = res.hold.id;
+      await this.updateWorkflowState(tenantId, workflow.id, {
+        quoteJson: quote,
+      });
+      return res.hold.id;
+    } catch (error) {
+      const errCode = (error as { code?: string })?.code ?? '';
+      const errMsg = error instanceof Error ? error.message : String(error);
+      if (
+        errCode === 'INSUFFICIENT_LOYALTY_POINTS' ||
+        errMsg.includes('INSUFFICIENT_LOYALTY_POINTS') ||
+        errMsg.includes('Insufficient available loyalty points') ||
+        errMsg.includes('409')
+      ) {
+        const prefix = getSchemaPrefix(this.dataSource);
+        await this.dataSource.transaction(async (em) => {
+          await em.query(`SELECT set_config('app.tenant_id', $1, true)`, [
+            tenantId,
+          ]);
+          await this.promotionsService.releaseCouponClaimWithinTransaction(
+            em,
+            tenantId,
+            orderId,
+          );
+          await em.query(
+            `UPDATE ${prefix}"checkout_workflow"
+             SET state = 'REJECTED', last_error = $3, updated_at = now()
+             WHERE tenant_id = $1 AND id = $2`,
+            [tenantId, workflow.id, `LOYALTY_HOLD_REJECTED: ${errMsg}`],
+          );
+        });
+        throw new SalesDomainError(
+          SalesDomainErrorCode.LOYALTY_HOLD_FAILED,
+          errMsg,
+          409,
+        );
+      }
+
+      await this.updateWorkflowState(tenantId, workflow.id, {
+        state: 'RECOVERY_PENDING',
+        lastError: errMsg,
+      });
+      throw new SalesDomainError(
+        SalesDomainErrorCode.LOYALTY_HOLD_FAILED,
+        `Loyalty point hold failed: ${errMsg}`,
+        503,
+      );
+    }
+  }
+
+  private async executeCreditAuthStep(
+    tenantId: string,
+    workflow: CheckoutWorkflowEntity,
+    quote: PersistedQuoteJson,
+    customerId: string,
+    orderId: string,
+    amount: string,
+    creditAuthKey: string,
+    actorId: string,
+  ): Promise<string> {
+    if (!this.financeCreditClient) {
+      throw new SalesDomainError(
+        SalesDomainErrorCode.CREDIT_SERVICE_UNAVAILABLE,
+        'FinanceCreditClient is not available; credit sales fail closed',
+        503,
+      );
+    }
+    try {
+      const res = await this.financeCreditClient.authorizeCredit({
+        actorId,
+        idempotencyKey: creditAuthKey,
+        customerId,
+        branchId: workflow.branchId,
+        orderId,
+        checkoutId: workflow.id,
+        amount,
+      });
+      quote.creditAuthId = res.authorization.id;
+      await this.updateWorkflowState(tenantId, workflow.id, {
+        quoteJson: quote,
+      });
+      return res.authorization.id;
+    } catch (error) {
+      const errCode = (error as { code?: string })?.code ?? '';
+      const errMsg = error instanceof Error ? error.message : String(error);
+
+      if (quote.loyaltyHoldId && !quote.loyaltyCommitted) {
+        await this.customerLoyaltyClient?.releaseHold({
+          actorId,
+          holdId: quote.loyaltyHoldId,
+          reason: 'CREDIT_AUTH_FAILED',
+          idempotencyKey: `${quote.loyaltyHoldKey ?? workflow.id}:release`,
+        });
+      }
+
+      if (
+        errCode === 'CREDIT_LIMIT_EXCEEDED' ||
+        errCode === 'CUSTOMER_CREDIT_FROZEN' ||
+        errMsg.includes('CREDIT_LIMIT_EXCEEDED') ||
+        errMsg.includes('exceeds available credit') ||
+        errMsg.includes('frozen')
+      ) {
+        const prefix = getSchemaPrefix(this.dataSource);
+        await this.dataSource.transaction(async (em) => {
+          await em.query(`SELECT set_config('app.tenant_id', $1, true)`, [
+            tenantId,
+          ]);
+          await this.promotionsService.releaseCouponClaimWithinTransaction(
+            em,
+            tenantId,
+            orderId,
+          );
+          await em.query(
+            `UPDATE ${prefix}"checkout_workflow"
+             SET state = 'REJECTED', last_error = $3, updated_at = now()
+             WHERE tenant_id = $1 AND id = $2`,
+            [tenantId, workflow.id, `CREDIT_AUTH_REJECTED: ${errMsg}`],
+          );
+        });
+        throw new SalesDomainError(
+          SalesDomainErrorCode.CREDIT_AUTHORIZATION_FAILED,
+          errMsg,
+          409,
+        );
+      }
+
+      // Fail-closed on Finance service unavailability or timeout
+      const prefix = getSchemaPrefix(this.dataSource);
+      await this.dataSource.transaction(async (em) => {
+        await em.query(`SELECT set_config('app.tenant_id', $1, true)`, [
+          tenantId,
+        ]);
+        await this.promotionsService.releaseCouponClaimWithinTransaction(
+          em,
+          tenantId,
+          orderId,
+        );
+        await em.query(
+          `UPDATE ${prefix}"checkout_workflow"
+           SET state = 'CANCELLED', last_error = $3, updated_at = now()
+           WHERE tenant_id = $1 AND id = $2`,
+          [tenantId, workflow.id, `FINANCE_UNAVAILABLE: ${errMsg}`],
+        );
+      });
+      throw new SalesDomainError(
+        SalesDomainErrorCode.CREDIT_SERVICE_UNAVAILABLE,
+        `Finance service unavailable for credit authorization (fail-closed): ${errMsg}`,
+        503,
+      );
+    }
+  }
+
   private async executeReserveStep(
     tenantId: string,
     workflow: CheckoutWorkflowEntity,
-    quote: CalculatedOrderQuote & { couponCode: string | null },
+    quote: PersistedQuoteJson,
     orderId: string,
+    actorId = 'system',
   ): Promise<string> {
     // Coalesce baseQty by skuCode so multi-line carts with same SKU reserve atomically
     const qtyBySku = new Map<string, bigint>();
@@ -820,6 +1217,23 @@ export class CheckoutService {
     }
 
     if (reserveResult.status === 'INSUFFICIENT_STOCK') {
+      // Compensate any held loyalty points or credit authorizations
+      if (quote.loyaltyHoldId && !quote.loyaltyCommitted) {
+        await this.customerLoyaltyClient?.releaseHold({
+          actorId,
+          holdId: quote.loyaltyHoldId,
+          reason: 'INSUFFICIENT_STOCK',
+          idempotencyKey: `${quote.loyaltyHoldKey ?? workflow.id}:release`,
+        });
+      }
+      if (quote.creditAuthId && !quote.creditCommitted) {
+        await this.financeCreditClient?.releaseAuthorization({
+          actorId,
+          authorizationId: quote.creditAuthId,
+          reason: 'INSUFFICIENT_STOCK',
+        });
+      }
+
       const prefix = getSchemaPrefix(this.dataSource);
       await this.dataSource.transaction(async (em) => {
         await em.query(`SELECT set_config('app.tenant_id', $1, true)`, [
@@ -850,6 +1264,7 @@ export class CheckoutService {
     await this.updateWorkflowState(tenantId, workflow.id, {
       state: 'STOCK_RESERVED',
       reservationId,
+      quoteJson: quote,
       lastError: null,
     });
 
@@ -861,12 +1276,13 @@ export class CheckoutService {
     checkoutId: string,
     reservationId: string,
     orderId: string,
-    quote: CalculatedOrderQuote & { couponCode: string | null },
+    quote: PersistedQuoteJson,
     tenderSummary: ValidatedTenderSummary,
     actorId: string,
     replayed: boolean,
     simulateFailureAfterCommit: boolean,
     alreadyCommitted = false,
+    simulateFailureAfterStockCommitBeforeLoyaltyCommit = false,
   ): Promise<PosCheckoutResult> {
     if (!alreadyCommitted) {
       await this.updateWorkflowState(tenantId, checkoutId, {
@@ -890,6 +1306,8 @@ export class CheckoutService {
               checkoutId,
               orderId,
               check.state,
+              quote,
+              actorId,
             );
           }
           if (check && check.state === 'COMMITTED') {
@@ -922,11 +1340,54 @@ export class CheckoutService {
       commitConfirmed: true,
     });
 
+    if (simulateFailureAfterStockCommitBeforeLoyaltyCommit) {
+      await this.updateWorkflowState(tenantId, checkoutId, {
+        state: 'RECOVERY_PENDING',
+        reservationId,
+        commitConfirmed: true,
+        quoteJson: quote,
+        lastError: 'SIMULATED_FAILURE_AFTER_STOCK_COMMIT_BEFORE_LOYALTY_COMMIT',
+      });
+      throw new SalesDomainError(
+        SalesDomainErrorCode.STOCK_COMMIT_PENDING,
+        'Simulated failure after stock commit before loyalty commit; checkout placed in RECOVERY_PENDING',
+        503,
+        {
+          checkoutId,
+          reservationId,
+          loyaltyHoldId: quote.loyaltyHoldId,
+          commitConfirmed: true,
+        },
+      );
+    }
+
+    // Commit Loyalty Hold if present and not yet committed
+    if (quote.loyaltyHoldId && !quote.loyaltyCommitted) {
+      if (!this.customerLoyaltyClient) {
+        throw new SalesDomainError(
+          SalesDomainErrorCode.LOYALTY_HOLD_FAILED,
+          'CustomerLoyaltyClient is not available to commit loyalty hold',
+          503,
+        );
+      }
+      await this.customerLoyaltyClient.commitHold({
+        actorId,
+        holdId: quote.loyaltyHoldId,
+        orderId,
+        idempotencyKey: `${quote.loyaltyHoldKey ?? checkoutId}:commit`,
+      });
+      quote.loyaltyCommitted = true;
+      await this.updateWorkflowState(tenantId, checkoutId, {
+        quoteJson: quote,
+      });
+    }
+
     if (simulateFailureAfterCommit) {
       await this.updateWorkflowState(tenantId, checkoutId, {
         state: 'RECOVERY_PENDING',
         reservationId,
         commitConfirmed: true,
+        quoteJson: quote,
         lastError: 'SIMULATED_FAILURE_AFTER_COMMIT',
       });
       throw new SalesDomainError(
@@ -1147,6 +1608,7 @@ export class CheckoutService {
       wf.orderId = orderId;
       wf.reservationId = reservationId;
       wf.commitConfirmed = true;
+      wf.quoteJson = quote;
       wf.lastError = null;
       wf.updatedAt = now;
       await em.save(CheckoutWorkflowEntity, wf);
@@ -1220,6 +1682,26 @@ export class CheckoutService {
       return { wf, orderCode, alreadyDone: false };
     });
 
+    // Commit Credit Authorization in Finance if present (posts AR receivable + journal entry)
+    if (quote.creditAuthId && !quote.creditCommitted) {
+      if (!this.financeCreditClient) {
+        throw new SalesDomainError(
+          SalesDomainErrorCode.CREDIT_SERVICE_UNAVAILABLE,
+          'FinanceCreditClient is not available to commit credit authorization',
+          503,
+        );
+      }
+      await this.financeCreditClient.commitAuthorization({
+        actorId,
+        authorizationId: quote.creditAuthId,
+        idempotencyKey: `${quote.creditAuthKey ?? checkoutId}:commit`,
+        orderId,
+        orderCode: finalized.orderCode,
+        branchId: finalized.wf.branchId,
+      });
+      quote.creditCommitted = true;
+    }
+
     return {
       checkoutId: finalized.wf.id,
       tenantId,
@@ -1229,6 +1711,8 @@ export class CheckoutService {
       state: 'CONFIRMED',
       reservationIdempotencyKey: finalized.wf.reservationIdempotencyKey,
       reservationId,
+      loyaltyHoldId: quote.loyaltyHoldId ?? null,
+      creditAuthorizationId: quote.creditAuthId ?? null,
       orderId,
       orderCode: finalized.orderCode,
       paymentStatus: tenderSummary.paymentStatus,
@@ -1301,7 +1785,9 @@ export class CheckoutService {
         const isConfirmedElectronic =
           t.method !== 'CASH' &&
           t.method !== 'COD' &&
-          (t.verified === true || t.status === 'CONFIRMED');
+          (t.verified === true ||
+            t.status === 'CONFIRMED' ||
+            t.method === 'ON_ACCOUNT');
         return {
           method: t.method,
           amount: t.amount,
@@ -1316,7 +1802,14 @@ export class CheckoutService {
 
     const rawMethod = (dto.paymentMethod ?? 'CASH').trim().toUpperCase();
     const method: Exclude<TenderMethod, 'COMBINED'> = (
-      ['CASH', 'BANK_TRANSFER', 'CARD', 'E_WALLET', 'COD'].includes(rawMethod)
+      [
+        'CASH',
+        'BANK_TRANSFER',
+        'CARD',
+        'E_WALLET',
+        'COD',
+        'ON_ACCOUNT',
+      ].includes(rawMethod)
         ? rawMethod
         : 'CASH'
     ) as Exclude<TenderMethod, 'COMBINED'>;
@@ -1440,6 +1933,8 @@ export class CheckoutService {
       paymentStatus = (wf.tendersJson as ValidatedTenderSummary).paymentStatus;
     }
 
+    const quote = (wf.quoteJson ?? {}) as PersistedQuoteJson;
+
     return {
       checkoutId: wf.id,
       tenantId: wf.tenantId,
@@ -1449,13 +1944,13 @@ export class CheckoutService {
       state: wf.state,
       reservationIdempotencyKey: wf.reservationIdempotencyKey,
       reservationId: wf.reservationId,
+      loyaltyHoldId: quote.loyaltyHoldId ?? null,
+      creditAuthorizationId: quote.creditAuthId ?? null,
       orderId: wf.orderId,
       orderCode,
       paymentStatus,
       fulfillmentStatus,
-      quote: (wf.quoteJson ?? {}) as CalculatedOrderQuote & {
-        couponCode: string | null;
-      },
+      quote,
       tenders: (wf.tendersJson ?? {}) as ValidatedTenderSummary,
       replayed,
     };

@@ -124,6 +124,10 @@ jobs:
         if: matrix.service == 'libs'
         run: pnpm test:scripts
 
+      - name: Run DDD Architecture Fitness & Boundary Gate (libs)
+        if: matrix.service == 'libs'
+        run: pnpm test:arch
+
       - name: Check shared-library versions against main (libs, PRs)
         # a removed or renamed export needs a major bump (ADR-0009)
         if: matrix.service == 'libs' && github.event_name == 'pull_request'
@@ -171,9 +175,9 @@ jobs:
         run: pnpm docs:build
 
   integration:
-    # the event bus, sales and insight against a real Postgres and a real SQS (ADR-0007); ElasticMQ is
-    # the same stand-in docker-compose uses, its default node address is localhost
-    name: Integration (event bus, sales, insight)
+    # Full-system integration (event bus, catalog, inventory, sales, customer, finance, integration, insight)
+    # against a real Postgres and a real SQS (ADR-0007); ElasticMQ is the same stand-in docker-compose uses
+    name: Integration (Full-System 8-Service Workflows & Event Bus)
     timeout-minutes: 15
     if: |
       !contains(github.event.pull_request.labels.*.name, 'skip-ci') &&

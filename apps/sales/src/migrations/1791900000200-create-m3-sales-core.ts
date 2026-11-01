@@ -325,7 +325,7 @@ export class CreateM3SalesCore1791900000200 implements MigrationInterface {
         CONSTRAINT "FK_order_tenders_order"
           FOREIGN KEY ("tenant_id", "order_id") REFERENCES ${orders}("tenant_id", "id") ON DELETE CASCADE,
         CONSTRAINT "CHK_order_tenders_method" CHECK (
-          "method" IN ('CASH', 'BANK_TRANSFER', 'CARD', 'E_WALLET', 'COD')
+          "method" IN ('CASH', 'BANK_TRANSFER', 'CARD', 'E_WALLET', 'COD', 'ON_ACCOUNT')
         ),
         CONSTRAINT "CHK_order_tenders_status" CHECK (
           "status" IN ('PENDING', 'CONFIRMED', 'FAILED')
