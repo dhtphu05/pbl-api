@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { roundVnd } from '../../common/money';
 import {
   IntegrationDomainError,
@@ -66,6 +66,142 @@ export class LazadaProviderAdapter implements MarketplaceProviderAdapter {
     };
   }
 
+  /**
+   * The published Lazada Auth API accepts signed system/business parameters.
+   * Never fabricate tokens; the seller must genuinely authorize this app.
+   */
+  private async callAuthApi(
+    apiPath: '/auth/token/create' | '/auth/token/refresh',
+    input: { code?: string; refresh_token?: string; appKey: string; appSecret: string },
+  ): Promise<Record<string, any>> {
+    if (process.env.LAZADA_LIVE_ENABLED !== 'true') {
+      throw new IntegrationDomainError(
+        IntegrationDomainErrorCode.PROVIDER_UNAVAILABLE,
+        'Lazada live API is not enabled',
+        503,
+      );
+    }
+    if (!input.appKey || !input.appSecret ||
+        input.appKey !== process.env.LAZADA_APP_KEY ||
+        input.appSecret !== process.env.LAZADA_APP_SECRET) {
+      throw new IntegrationDomainError(
+        IntegrationDomainErrorCode.CHANNEL_AUTHORIZATION_FAILED,
+        'Lazada application credentials are not configured consistently',
+        503,
+      );
+    }
+    const payload: Record<string, string> = {
+      app_key: input.appKey,
+      timestamp: Date.now().toString(),
+      sign_method: 'sha256',
+    };
+    if (input.code) payload.code = input.code;
+    if (input.refresh_token) payload.refresh_token = input.refresh_token;
+    payload.sign = computeLazadaApiSignature({
+      appSecret: input.appSecret,
+      apiPath,
+      queryParams: payload,
+    });
+    const root = (process.env.LAZADA_AUTH_API_BASE_URL || 'https://auth.lazada.com/rest')
+      .replace(/\/+$/, '');
+    if (!root.startsWith('https://auth.lazada.com/rest')) {
+      throw new IntegrationDomainError(
+        IntegrationDomainErrorCode.CHANNEL_AUTHORIZATION_FAILED,
+        'Unsupported Lazada auth API host',
+        503,
+      );
+    }
+    let response: Response;
+    try {
+      response = await fetch(root + apiPath, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams(payload).toString(),
+        signal: AbortSignal.timeout(10000),
+      });
+    } catch {
+      throw new IntegrationDomainError(
+        IntegrationDomainErrorCode.PROVIDER_UNAVAILABLE,
+        'Lazada authorization API could not be reached',
+        503,
+      );
+    }
+    if (!response.ok) {
+      throw new IntegrationDomainError(
+        IntegrationDomainErrorCode.CHANNEL_AUTHORIZATION_FAILED,
+        'Lazada authorization API rejected the request',
+        502,
+      );
+    }
+    let body: Record<string, any>;
+    try {
+      body = await response.json() as Record<string, any>;
+    } catch {
+      throw new IntegrationDomainError(
+        IntegrationDomainErrorCode.CHANNEL_AUTHORIZATION_FAILED,
+        'Invalid Lazada authorization API response',
+        502,
+      );
+    }
+    if (String(body.code) !== '0' || !body.access_token || !body.refresh_token) {
+      // Do not log or return the raw token-bearing provider response.
+      throw new IntegrationDomainError(
+        IntegrationDomainErrorCode.CHANNEL_AUTHORIZATION_FAILED,
+        'Lazada token exchange was rejected by the provider',
+        401,
+      );
+    }
+    return body;
+  }
+
+  private tokenResult(
+    body: Record<string, any>,
+    fallbackShopId?: string,
+  ): TokenExchangeResult {
+    const countryUsers = Array.isArray(body.country_user_info) ? body.country_user_info : [];
+    const vnSeller = countryUsers.find(
+      (entry: Record<string, unknown>) => String(entry.country ?? '').toLowerCase() === 'vn',
+    );
+    if (String(body.country ?? '').toLowerCase() !== 'vn' && !vnSeller) {
+      throw new IntegrationDomainError(
+        IntegrationDomainErrorCode.CHANNEL_AUTHORIZATION_FAILED,
+        'Lazada account is not authorized for the Vietnam marketplace',
+        403,
+      );
+    }
+    const externalShopId = String(
+      vnSeller?.seller_id ?? vnSeller?.short_code ?? body.account_id ?? fallbackShopId ?? '',
+    ).trim();
+    if (!externalShopId) {
+      throw new IntegrationDomainError(
+        IntegrationDomainErrorCode.CHANNEL_AUTHORIZATION_FAILED,
+        'Authorized Lazada seller identity is missing',
+        502,
+      );
+    }
+    const expiresInSeconds = Number(body.expires_in);
+    const refreshSeconds = Number(body.refresh_expires_in);
+    if (!Number.isFinite(expiresInSeconds) || expiresInSeconds <= 0 ||
+        !Number.isFinite(refreshSeconds) || refreshSeconds <= 0) {
+      throw new IntegrationDomainError(
+        IntegrationDomainErrorCode.CHANNEL_AUTHORIZATION_FAILED,
+        'Lazada token expiration metadata is invalid',
+        502,
+      );
+    }
+    const now = Date.now();
+    return {
+      externalShopId,
+      shopName: 'Lazada Shop ' + externalShopId,
+      accessToken: String(body.access_token),
+      refreshToken: String(body.refresh_token),
+      accessTokenExpiresAt: new Date(now + expiresInSeconds * 1000),
+      refreshTokenExpiresAt: new Date(now + refreshSeconds * 1000),
+      scopes: [],
+      liveMode: true,
+    };
+  }
+
   async exchangeAuthorizationCode(params: {
     connectionId: string;
     code: string;
@@ -76,32 +212,16 @@ export class LazadaProviderAdapter implements MarketplaceProviderAdapter {
     if (!params.code || params.code.trim().length < 4) {
       throw new IntegrationDomainError(
         IntegrationDomainErrorCode.CHANNEL_AUTHORIZATION_FAILED,
-        'Lazada authorization code is invalid or empty',
+        'Lazada authorization code is invalid',
         400,
       );
     }
-    const now = Date.now();
-    const tokenSeed = createHash('sha256')
-      .update(
-        `lazada:exchange:${params.connectionId}:${params.externalShopId}:${params.code}:${now}:${randomUUID()}`,
-      )
-      .digest('hex');
-
-    return {
-      externalShopId: params.externalShopId,
-      shopName: `Lazada Seller ${params.externalShopId}`,
-      accessToken: `lzd_at_${tokenSeed.slice(0, 32)}`,
-      refreshToken: `lzd_rt_${tokenSeed.slice(32, 64)}`,
-      accessTokenExpiresAt: new Date(now + 7 * 24 * 3600 * 1000), // 7 days
-      refreshTokenExpiresAt: new Date(now + 30 * 24 * 3600 * 1000), // 30 days
-      scopes: [
-        'seller.read',
-        'order.read',
-        'product.stock.write',
-        'product.read',
-      ],
-      liveMode: this.getCapabilities().liveCredentialsConfigured,
-    };
+    const body = await this.callAuthApi('/auth/token/create', {
+      code: params.code,
+      appKey: params.partnerId,
+      appSecret: params.partnerSecret,
+    });
+    return this.tokenResult(body);
   }
 
   async refreshAccessToken(params: {
@@ -111,35 +231,19 @@ export class LazadaProviderAdapter implements MarketplaceProviderAdapter {
     partnerId: string;
     partnerSecret: string;
   }): Promise<TokenExchangeResult> {
-    if (!params.refreshToken || params.refreshToken.includes('expired')) {
+    if (!params.refreshToken) {
       throw new IntegrationDomainError(
         IntegrationDomainErrorCode.CHANNEL_REAUTH_REQUIRED,
-        'Lazada refresh_token is expired or revoked; seller re-authorization required',
+        'Missing Lazada refresh token',
         401,
       );
     }
-    const now = Date.now();
-    const tokenSeed = createHash('sha256')
-      .update(
-        `lazada:refresh:${params.connectionId}:${params.refreshToken}:${now}:${randomUUID()}`,
-      )
-      .digest('hex');
-
-    return {
-      externalShopId: params.externalShopId,
-      shopName: `Lazada Seller ${params.externalShopId}`,
-      accessToken: `lzd_at_${tokenSeed.slice(0, 32)}`,
-      refreshToken: `lzd_rt_${tokenSeed.slice(32, 64)}`,
-      accessTokenExpiresAt: new Date(now + 7 * 24 * 3600 * 1000),
-      refreshTokenExpiresAt: new Date(now + 30 * 24 * 3600 * 1000),
-      scopes: [
-        'seller.read',
-        'order.read',
-        'product.stock.write',
-        'product.read',
-      ],
-      liveMode: this.getCapabilities().liveCredentialsConfigured,
-    };
+    const body = await this.callAuthApi('/auth/token/refresh', {
+      refresh_token: params.refreshToken,
+      appKey: params.partnerId,
+      appSecret: params.partnerSecret,
+    });
+    return this.tokenResult(body, params.externalShopId);
   }
 
   verifyAndParseWebhook(params: {
