@@ -4,7 +4,7 @@ import { Public } from '@pbl/auth';
 import { TenantContext } from '@pbl/common';
 import type { Response } from 'express';
 import { ConnectionsService } from './connections.service';
-import { verifyLazadaOAuthState } from './lazada-oauth-state';
+import { validateSignedOAuthState } from './lazada-oauth-state';
 
 /**
  * Lazada sends a browser GET without the Platform JWT. The signed state is
@@ -30,7 +30,7 @@ export class LazadaCallbackController {
       return;
     }
     try {
-      const claims = verifyLazadaOAuthState(state);
+      const claims = validateSignedOAuthState(state);
       await TenantContext.run(claims.tenantId, () =>
         this.connections.authorizeConnection(claims.connectionId, claims.actorId, {
           authorizationCode: code,
