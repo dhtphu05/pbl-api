@@ -1904,6 +1904,26 @@
       ]
     },
     {
+      "endpoint": "/api/v1/integrations/lazada/callback",
+      "method": "GET",
+      "output_encoding": "no-op",
+      "input_query_strings": [
+        "code",
+        "state",
+        "error",
+        "error_description"
+      ],
+      "backend": [
+        {
+          "url_pattern": "/api/v1/integrations/lazada/callback",
+          "encoding": "no-op",
+          "host": [
+            "http://integration:3000"
+          ]
+        }
+      ]
+    },
+    {
       "endpoint": "/integration/health",
       "method": "GET",
       "output_encoding": "no-op",
