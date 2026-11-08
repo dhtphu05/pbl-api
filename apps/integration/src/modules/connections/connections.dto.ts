@@ -15,15 +15,15 @@ export class CreateChannelConnectionDto {
   @IsIn(['SHOPEE', 'LAZADA'])
   provider!: MarketplaceProvider;
 
+  @IsOptional()
   @IsString()
-  @IsNotEmpty()
   @MaxLength(128)
-  externalShopId!: string;
+  externalShopId?: string;
 
+  @IsOptional()
   @IsString()
-  @IsNotEmpty()
   @MaxLength(160)
-  shopName!: string;
+  shopName?: string;
 
   @IsUUID()
   branchId!: string;
@@ -43,10 +43,10 @@ export class CreateChannelConnectionDto {
   @Max(100)
   stockAllocationPercent?: number;
 
+  @IsOptional()
   @IsString()
-  @IsNotEmpty()
   @MaxLength(256)
-  webhookSecret!: string;
+  webhookSecret?: string;
 
   @IsOptional()
   @IsString()
