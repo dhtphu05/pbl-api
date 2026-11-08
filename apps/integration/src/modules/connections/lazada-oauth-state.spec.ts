@@ -1,6 +1,6 @@
 import {
   createLazadaOAuthState,
-  verifyLazadaOAuthState,
+  validateSignedOAuthState,
 } from './lazada-oauth-state';
 
 describe('Lazada OAuth signed state', () => {
@@ -20,14 +20,14 @@ describe('Lazada OAuth signed state', () => {
 
   it('round trips a signed tenant and connection identity', () => {
     const state = createLazadaOAuthState(claims, 1_000_000);
-    expect(verifyLazadaOAuthState(state, 1_100_000)).toEqual(
+    expect(validateSignedOAuthState(state, 1_100_000)).toEqual(
       expect.objectContaining(claims),
     );
   });
 
   it('rejects tampering and expiration', () => {
     const state = createLazadaOAuthState(claims, 1_000_000);
-    expect(() => verifyLazadaOAuthState(state + 'x', 1_100_000)).toThrow();
-    expect(() => verifyLazadaOAuthState(state, 1_700_001)).toThrow();
+    expect(() => validateSignedOAuthState(state + 'x', 1_100_000)).toThrow();
+    expect(() => validateSignedOAuthState(state, 1_700_001)).toThrow();
   });
 });
