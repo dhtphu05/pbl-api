@@ -717,18 +717,59 @@ export class LazadaProviderAdapter implements MarketplaceProviderAdapter {
     partnerSecret: string;
     partnerId?: string | null;
   }): Promise<ExternalProductListingVariation[]> {
-    const apiPath = '/products/get';
     return this.rateLimiter.executeGuardedProviderCall(
       {
         tenantId: params.tenantId,
         connectionId: params.connectionId,
         provider: 'LAZADA',
         operation: 'products_get',
-        endpoint: apiPath,
+        endpoint: '/products/get',
       },
       async () => {
-        return this.rateLimiter.getSimulatedListings(params.connectionId);
+        if (process.env.LAZADA_LIVE_ENABLED !== 'true') {
+          if (process.env.NODE_ENV === 'test' || process.env.LAZADA_SIMULATOR_ENABLED === 'true') {
+            return this.rateLimiter.getSimulatedListings(params.connectionId);
+          }
+          throw new IntegrationDomainError(
+            IntegrationDomainErrorCode.PROVIDER_UNAVAILABLE,
+            'Live Lazada product listing access is disabled',
+            503,
+          );
+        }
+        const response = await this.callShopApi('/products/get', {
+          filter: 'all', limit: '50', offset: '0',
+        }, params.accessToken, params.partnerId || process.env.LAZADA_APP_KEY!, params.partnerSecret);
+        const products = response.data?.products;
+        if (!Array.isArray(products)) {
+          throw new IntegrationDomainError(
+            IntegrationDomainErrorCode.PROVIDER_UNAVAILABLE,
+            'Lazada returned an invalid products collection',
+            502,
+          );
+        }
+        const listings: ExternalProductListingVariation[] = [];
+        for (const product of products) {
+          const itemId = String(product.item_id ?? '').trim();
+          if (!itemId) continue;
+          const productName = String(product.attributes?.name ?? product.name ?? 'Lazada Product');
+          const skus = Array.isArray(product.skus) ? product.skus : [];
+          for (const sku of skus) {
+            const skuId = String(sku.SkuId ?? sku.sku_id ?? '').trim();
+            if (!skuId) continue;
+            listings.push({
+              externalItemId: itemId,
+              externalSkuId: skuId,
+              externalSkuCode: String(sku.SellerSku ?? sku.seller_sku ?? '').trim() || null,
+              externalProductName: productName,
+              price: Number(sku.price ?? sku.special_price ?? 0),
+              stock: Number(sku.quantity ?? 0),
+              status: sku.Status === 'inactive' ? 'INACTIVE' : 'ACTIVE',
+            });
+          }
+        }
+        return listings;
       },
     );
   }
+
 }
