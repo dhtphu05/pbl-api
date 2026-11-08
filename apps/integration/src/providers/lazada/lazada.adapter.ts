@@ -42,7 +42,7 @@ export class LazadaProviderAdapter implements MarketplaceProviderAdapter {
       supportsWebhookSignatureVerification: true,
       supportsIncrementalOrderPolling: true,
       supportsBatchOrderFetch: true,
-      supportsInventoryPublication: true,
+      supportsInventoryPublication: false, // disabled: no writes to live seller in read-only MVP
       supportsProductListingDiscovery: true,
       liveCredentialsConfigured: liveConfigured,
     };
@@ -409,9 +409,8 @@ export class LazadaProviderAdapter implements MarketplaceProviderAdapter {
     const totalAmount = roundVnd(
       rawOrder.price ?? rawOrder.total_amount ?? linesSubtotal + shippingFee,
     );
-    const updateTimeSec = Number(
-      rawOrder.updated_at_sec ?? Math.floor(Date.now() / 1000),
-    );
+    const parsedUpdatedAt = rawOrder.updated_at ? Date.parse(String(rawOrder.updated_at)) : NaN;
+    const updateTimeSec = Number(rawOrder.updated_at_sec ?? (Number.isFinite(parsedUpdatedAt) ? Math.floor(parsedUpdatedAt / 1000) : Date.now() / 1000));
 
     return {
       provider: 'LAZADA',
@@ -432,6 +431,79 @@ export class LazadaProviderAdapter implements MarketplaceProviderAdapter {
     };
   }
 
+  private async callShopApi(
+    apiPath: string,
+    params: Record<string, string>,
+    accessToken: string,
+    appKey: string,
+    appSecret: string,
+  ): Promise<Record<string, any>> {
+    if (process.env.LAZADA_LIVE_ENABLED !== 'true') {
+      throw new IntegrationDomainError(
+        IntegrationDomainErrorCode.PROVIDER_UNAVAILABLE,
+        'Lazada live order API is not enabled',
+        503,
+      );
+    }
+    if (!accessToken || appKey !== process.env.LAZADA_APP_KEY ||
+        appSecret !== process.env.LAZADA_APP_SECRET) {
+      throw new IntegrationDomainError(
+        IntegrationDomainErrorCode.CHANNEL_AUTHORIZATION_FAILED,
+        'Lazada seller token or server credentials are missing',
+        401,
+      );
+    }
+    const payload: Record<string, string> = {
+      app_key: appKey, access_token: accessToken,
+      timestamp: Date.now().toString(), sign_method: 'sha256',
+      ...params,
+    };
+    const sign = computeLazadaApiSignature({
+      appSecret, apiPath, queryParams: payload,
+    });
+    const url = new URL('https://api.lazada.vn/rest' + apiPath);
+    for (const [key, value] of Object.entries(payload)) url.searchParams.set(key, value);
+    url.searchParams.set('sign', sign);
+    let response: Response;
+    try {
+      response = await fetch(url.toString(), {
+        method: 'GET', signal: AbortSignal.timeout(10000),
+      });
+    } catch {
+      throw new IntegrationDomainError(
+        IntegrationDomainErrorCode.PROVIDER_UNAVAILABLE,
+        'Lazada order API request timed out or could not be reached',
+        503,
+      );
+    }
+    if (!response.ok) {
+      throw new IntegrationDomainError(
+        IntegrationDomainErrorCode.PROVIDER_UNAVAILABLE,
+        'Lazada API returned an unsuccessful HTTP status',
+        response.status === 429 ? 429 : 502,
+      );
+    }
+    let body: Record<string, any>;
+    try {
+      body = await response.json() as Record<string, any>;
+    } catch {
+      throw new IntegrationDomainError(
+        IntegrationDomainErrorCode.PROVIDER_UNAVAILABLE,
+        'Lazada order API returned invalid JSON',
+        502,
+      );
+    }
+    if (String(body.code) !== '0') {
+      // Never leak the URL (which contains access_token) or response containing buyer PII.
+      throw new IntegrationDomainError(
+        IntegrationDomainErrorCode.PROVIDER_UNAVAILABLE,
+        'Lazada API rejected the signed order request',
+        502,
+      );
+    }
+    return body;
+  }
+
   async fetchOrderDetails(params: {
     tenantId: string;
     connectionId: string;
@@ -441,27 +513,49 @@ export class LazadaProviderAdapter implements MarketplaceProviderAdapter {
     partnerSecret: string;
     partnerId?: string | null;
   }): Promise<NormalizedExternalOrder> {
-    const apiPath = '/order/items/get';
     return this.rateLimiter.executeGuardedProviderCall(
       {
         tenantId: params.tenantId,
         connectionId: params.connectionId,
         provider: 'LAZADA',
         operation: 'order_items_get',
-        endpoint: apiPath,
+        endpoint: '/order/items/get',
       },
       async () => {
-        const seeded = this.rateLimiter.getSimulatedOrder(
-          params.connectionId,
-          params.externalOrderId,
-        );
-        if (seeded) {
-          return seeded;
+        if (process.env.LAZADA_LIVE_ENABLED !== 'true') {
+          if (process.env.NODE_ENV === 'test' || process.env.LAZADA_SIMULATOR_ENABLED === 'true') {
+            const seeded = this.rateLimiter.getSimulatedOrder(
+              params.connectionId, params.externalOrderId,
+            );
+            if (seeded) return seeded;
+          }
+          throw new IntegrationDomainError(
+            IntegrationDomainErrorCode.PROVIDER_UNAVAILABLE,
+            'Lazada live API is disabled; no actual order fetched',
+            503,
+          );
         }
-        throw new IntegrationDomainError(
-          IntegrationDomainErrorCode.PROVIDER_UNAVAILABLE,
-          `Lazada order ${params.externalOrderId} not found in simulator and live Lazada API is BLOCKED_NO_CREDENTIALS`,
-          503,
+        const key = params.partnerId || process.env.LAZADA_APP_KEY!;
+        const [order, items] = await Promise.all([
+          this.callShopApi('/order/get', { order_id: params.externalOrderId },
+            params.accessToken, key, params.partnerSecret),
+          this.callShopApi('/order/items/get', { order_id: params.externalOrderId },
+            params.accessToken, key, params.partnerSecret),
+        ]);
+        const rawOrder = order.data ?? {};
+        const itemList = Array.isArray(items.data)
+          ? items.data
+          : (Array.isArray(items.data?.order_items) ? items.data.order_items : []);
+        if (!rawOrder.order_id || itemList.length === 0) {
+          throw new IntegrationDomainError(
+            IntegrationDomainErrorCode.WEBHOOK_PAYLOAD_UNSUPPORTED,
+            'Lazada order or order items were missing',
+            502,
+          );
+        }
+        return this.normalizeOrderPayload(
+          { ...rawOrder, order_items: itemList },
+          params.externalShopId,
         );
       },
     );
@@ -482,26 +576,80 @@ export class LazadaProviderAdapter implements MarketplaceProviderAdapter {
     nextCursor: string | null;
     hasMore: boolean;
   }> {
-    const apiPath = '/orders/get';
     return this.rateLimiter.executeGuardedProviderCall(
       {
         tenantId: params.tenantId,
         connectionId: params.connectionId,
         provider: 'LAZADA',
         operation: 'orders_get',
-        endpoint: apiPath,
+        endpoint: '/orders/get',
       },
       async () => {
-        const all = this.rateLimiter.listSimulatedOrders(params.connectionId);
-        const filtered = all.filter(
-          (o) =>
-            o.externalUpdatedAt.getTime() >= params.windowStart.getTime() &&
-            o.externalUpdatedAt.getTime() <= params.windowEnd.getTime(),
-        );
+        if (process.env.LAZADA_LIVE_ENABLED !== 'true') {
+          if (process.env.NODE_ENV === 'test' || process.env.LAZADA_SIMULATOR_ENABLED === 'true') {
+            const all = this.rateLimiter.listSimulatedOrders(params.connectionId);
+            return {
+              orders: all.filter((o) =>
+                o.externalUpdatedAt.getTime() >= params.windowStart.getTime() &&
+                o.externalUpdatedAt.getTime() <= params.windowEnd.getTime(),
+              ),
+              nextCursor: null, hasMore: false,
+            };
+          }
+          throw new IntegrationDomainError(
+            IntegrationDomainErrorCode.PROVIDER_UNAVAILABLE,
+            'Lazada live API is disabled; no actual orders fetched',
+            503,
+          );
+        }
+        const offset = params.cursor ? Number(params.cursor) : 0;
+        if (!Number.isSafeInteger(offset) || offset < 0 || offset > 100000) {
+          throw new IntegrationDomainError(
+            IntegrationDomainErrorCode.VALIDATION_ERROR,
+            'Invalid Lazada orders pagination offset',
+            400,
+          );
+        }
+        const limit = 20;
+        const result = await this.callShopApi('/orders/get', {
+          update_after: params.windowStart.toISOString(),
+          update_before: params.windowEnd.toISOString(),
+          sort_by: 'updated_at',
+          sort_direction: 'ASC',
+          offset: String(offset), limit: String(limit),
+        }, params.accessToken, params.partnerId || process.env.LAZADA_APP_KEY!, params.partnerSecret);
+        const rawOrders = result.data?.orders;
+        if (!Array.isArray(rawOrders)) {
+          throw new IntegrationDomainError(
+            IntegrationDomainErrorCode.PROVIDER_UNAVAILABLE,
+            'Lazada returned an invalid orders collection',
+            502,
+          );
+        }
+        const orders: NormalizedExternalOrder[] = [];
+        for (const order of rawOrders) {
+          const orderId = String(order.order_id ?? '').trim();
+          if (!orderId) throw new IntegrationDomainError(
+            IntegrationDomainErrorCode.PROVIDER_UNAVAILABLE,
+            'Lazada order is missing its order_id',
+            502,
+          );
+          orders.push(await this.fetchOrderDetails({
+            tenantId: params.tenantId, connectionId: params.connectionId,
+            externalShopId: params.externalShopId,
+            externalOrderId: orderId,
+            accessToken: params.accessToken,
+            partnerId: params.partnerId, partnerSecret: params.partnerSecret,
+          }));
+        }
+        const countTotal = Number(result.data?.countTotal);
+        const hasMore = Number.isFinite(countTotal)
+          ? offset + rawOrders.length < countTotal
+          : rawOrders.length === limit;
         return {
-          orders: filtered,
-          nextCursor: null,
-          hasMore: false,
+          orders,
+          nextCursor: hasMore ? String(offset + rawOrders.length) : null,
+          hasMore,
         };
       },
     );
@@ -510,6 +658,13 @@ export class LazadaProviderAdapter implements MarketplaceProviderAdapter {
   async publishInventoryStock(
     command: InventoryPublicationCommand,
   ): Promise<InventoryPublicationResult> {
+    if (process.env.LAZADA_LIVE_ENABLED === 'true') {
+      throw new IntegrationDomainError(
+        IntegrationDomainErrorCode.PROVIDER_CAPABILITY_UNSUPPORTED,
+        'Lazada inventory write-back is disabled in the read-only MVP',
+        403,
+      );
+    }
     const apiPath = '/product/price_quantity/update';
     const timestamp = Date.now();
     const requestSignature = computeLazadaApiSignature({
