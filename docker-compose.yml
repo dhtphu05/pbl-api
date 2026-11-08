@@ -111,6 +111,12 @@ services:
       INTERNAL_S2S_TOKEN: ${INTERNAL_S2S_TOKEN:-local-dev-internal-token-change-me}
       # encrypts marketplace credentials: a LOCAL development value (at least 32 characters); deployments set a real secret
       INTEGRATION_CREDENTIAL_MASTER_KEY: ${INTEGRATION_CREDENTIAL_MASTER_KEY:-local-dev-credential-key-0123456789abcdef}
+      # Lazada OAuth: only enable after App Key/Secret are configured securely.
+      LAZADA_LIVE_ENABLED: ${LAZADA_LIVE_ENABLED:-false}
+      LAZADA_APP_KEY: ${LAZADA_APP_KEY:-}
+      LAZADA_APP_SECRET: ${LAZADA_APP_SECRET:-}
+      LAZADA_OAUTH_STATE_SECRET: ${LAZADA_OAUTH_STATE_SECRET:-}
+      LAZADA_CALLBACK_URL: ${LAZADA_CALLBACK_URL:-https://api.sai.makeasy.id.vn/api/v1/integrations/lazada/callback}
       EVENTS_TRANSPORT: sqs-direct
       AWS_REGION: ap-southeast-1
       AWS_ENDPOINT_URL_SQS: http://elasticmq:9324
