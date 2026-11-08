@@ -33,7 +33,7 @@ export function createLazadaOAuthState(
   return payload + '.' + signature(payload, stateSecret()).toString('base64url');
 }
 
-export function verifyLazadaOAuthState(
+export function validateSignedOAuthState(
   state: string,
   now = Date.now(),
 ): LazadaOAuthStateClaims {
