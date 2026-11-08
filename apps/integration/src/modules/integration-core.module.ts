@@ -10,6 +10,7 @@ import { BranchScopeService } from './branch-scope/branch-scope.service';
 import { ConflictsController } from './conflicts/conflicts.controller';
 import { ConflictsService } from './conflicts/conflicts.service';
 import { ConnectionsController } from './connections/connections.controller';
+import { LazadaCallbackController } from './connections/lazada-callback.controller';
 import { ConnectionsService } from './connections/connections.service';
 import { InventorySyncService } from './inventory-sync/inventory-sync.service';
 import { OrderSyncService } from './order-sync/order-sync.service';
@@ -29,6 +30,7 @@ import { WebhooksService } from './webhooks/webhooks.service';
   ],
   controllers: [
     ConnectionsController,
+    LazadaCallbackController,
     SkuMappingController,
     SyncJobsController,
     ConflictsController,
