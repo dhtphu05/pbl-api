@@ -25,6 +25,7 @@ import {
   IntegrationAuditLogEntity,
 } from '../../infrastructure/persistence/integration.entities';
 import { ProviderRateLimiterService } from '../../infrastructure/rate-limiting/provider-rate-limiter.service';
+import { createLazadaOAuthState } from './lazada-oauth-state';
 import { ProviderRegistryService } from '../../providers/provider-registry.service';
 import {
   AuthorizeChannelConnectionDto,
@@ -86,7 +87,26 @@ export class ConnectionsService {
     dto: CreateChannelConnectionDto,
   ): Promise<SanitizedChannelConnectionView> {
     const tenantId = TenantContext.require();
-    const initialStatus: ConnectionStatus = dto.accessToken
+    const realLazada = dto.provider === 'LAZADA' && process.env.NODE_ENV !== 'test';
+    if (realLazada && process.env.LAZADA_LIVE_ENABLED !== 'true') {
+      throw new IntegrationDomainError(
+        IntegrationDomainErrorCode.CHANNEL_AUTHORIZATION_FAILED,
+        'Lazada integration is disabled or not configured',
+        503,
+      );
+    }
+    const configuredSecret = realLazada ? process.env.LAZADA_APP_SECRET : dto.webhookSecret;
+    const configuredAppKey = realLazada ? process.env.LAZADA_APP_KEY : dto.partnerId;
+    if (!configuredSecret || (realLazada && !configuredAppKey)) {
+      throw new IntegrationDomainError(
+        IntegrationDomainErrorCode.CHANNEL_AUTHORIZATION_FAILED,
+        'Provider credentials are not configured on the server',
+        503,
+      );
+    }
+    const suppliedAccessToken = realLazada ? undefined : dto.accessToken;
+    const suppliedRefreshToken = realLazada ? undefined : dto.refreshToken;
+    const initialStatus: ConnectionStatus = suppliedAccessToken
       ? 'CONNECTED'
       : 'PENDING_AUTH';
 
@@ -106,8 +126,8 @@ export class ConnectionsService {
           code,
           provider: dto.provider,
           connectionKey,
-          externalShopId: dto.externalShopId.trim(),
-          shopName: dto.shopName.trim(),
+          externalShopId: dto.externalShopId?.trim() || ('pending-' + randomUUID()),
+          shopName: dto.shopName?.trim() || (dto.provider + ' authorization pending'),
           branchId: dto.branchId,
           warehouseId: dto.warehouseId ?? null,
           status: initialStatus,
@@ -132,25 +152,25 @@ export class ConnectionsService {
           tenantId,
           connectionId: conn.id,
           credentialVersion: 1,
-          encryptedAccessToken: dto.accessToken
-            ? encryptCredentialSecret(dto.accessToken)
+          encryptedAccessToken: suppliedAccessToken
+            ? encryptCredentialSecret(suppliedAccessToken)
             : null,
-          encryptedRefreshToken: dto.refreshToken
-            ? encryptCredentialSecret(dto.refreshToken)
+          encryptedRefreshToken: suppliedRefreshToken
+            ? encryptCredentialSecret(suppliedRefreshToken)
             : null,
-          encryptedWebhookSecret: encryptCredentialSecret(dto.webhookSecret),
-          partnerId: dto.partnerId ?? `${dto.provider.toLowerCase()}-partner`,
+          encryptedWebhookSecret: encryptCredentialSecret(configuredSecret),
+          partnerId: configuredAppKey ?? (dto.provider.toLowerCase() + '-partner'),
           keyVersion: 1,
-          accessTokenExpiresAt: dto.accessToken
+          accessTokenExpiresAt: suppliedAccessToken
             ? new Date(now.getTime() + 4 * 3600 * 1000)
             : null,
-          refreshTokenExpiresAt: dto.refreshToken
+          refreshTokenExpiresAt: suppliedRefreshToken
             ? new Date(now.getTime() + 30 * 24 * 3600 * 1000)
             : null,
           scopes: 'order.read,product.stock.write,product.read',
           refreshLeaseOwner: null,
           refreshLeaseExpiresAt: null,
-          lastRefreshedAt: dto.accessToken ? now : null,
+          lastRefreshedAt: suppliedAccessToken ? now : null,
         });
         await em.save(ConnectionCredentialEntity, cred);
 
