@@ -55,6 +55,27 @@ export function readInternalToken(
   return token;
 }
 
+/** Read-only Lazada integration is explicitly enabled only when credentials are present. */
+export function assertLazadaConfig(env: Record<string, string | undefined> = process.env): void {
+  if (env.LAZADA_LIVE_ENABLED !== 'true') return;
+  for (const name of ['LAZADA_APP_KEY', 'LAZADA_APP_SECRET', 'LAZADA_OAUTH_STATE_SECRET', 'LAZADA_CALLBACK_URL']) {
+    if (!env[name]) throw new Error(name + ' is required when LAZADA_LIVE_ENABLED=true');
+  }
+  if (Buffer.byteLength(env.LAZADA_OAUTH_STATE_SECRET!, 'utf8') < 32) {
+    throw new Error('LAZADA_OAUTH_STATE_SECRET must contain at least 32 bytes');
+  }
+  const url = new URL(env.LAZADA_CALLBACK_URL!);
+  if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) {
+    throw new Error('LAZADA_CALLBACK_URL must be a plain HTTPS callback URL');
+  }
+  if (env.LAZADA_POST_AUTH_REDIRECT_URL) {
+    const successUrl = new URL(env.LAZADA_POST_AUTH_REDIRECT_URL);
+    if (successUrl.protocol !== 'https:' || successUrl.username || successUrl.password) {
+      throw new Error('LAZADA_POST_AUTH_REDIRECT_URL must be HTTPS');
+    }
+  }
+}
+
 /** Called before the app starts: throws (naming the variable, never a value) when a required one is missing. */
 export function assertIntegrationConfig(
   env: Record<string, string | undefined> = process.env,
@@ -63,4 +84,5 @@ export function assertIntegrationConfig(
   readCredentialMasterKey(env);
   readSalesUrl(env);
   readInternalToken(env);
+  assertLazadaConfig(env);
 }
